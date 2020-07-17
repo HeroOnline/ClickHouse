@@ -860,8 +860,6 @@ void CacheDictionary::update(BunchUpdateUnit & bunch_update_unit) const
 
     const auto now = std::chrono::system_clock::now();
 
-    /// Non const because it will be unlocked.
-    ProfilingScopedWriteRWLock write_lock{rw_lock, ProfileEvents::DictCacheLockWriteNs};
 
     if (now > backoff_end_time.load())
     {
@@ -869,6 +867,8 @@ void CacheDictionary::update(BunchUpdateUnit & bunch_update_unit) const
         {
             if (error_count)
             {
+                ProfilingScopedWriteRWLock write_lock{rw_lock, ProfileEvents::DictCacheLockWriteNs};
+
                 /// Recover after error: we have to clone the source here because
                 /// it could keep connections which should be reset after error.
                 source_ptr = source_ptr->clone();
@@ -879,22 +879,23 @@ void CacheDictionary::update(BunchUpdateUnit & bunch_update_unit) const
             /// To perform parallel loading.
             BlockInputStreamPtr stream = nullptr;
             {
-                ProfilingScopedWriteUnlocker unlocker(write_lock);
+                ProfilingScopedReadRWLock read_lock{rw_lock, ProfileEvents::DictCacheLockReadNs};
                 stream = source_ptr->loadIds(bunch_update_unit.getRequestedIds());
+                stream->readPrefix();
             }
 
-            stream->readPrefix();
 
             while (true)
             {
                 Block block;
                 {
-                    ProfilingScopedWriteUnlocker unlocker(write_lock);
+                    ProfilingScopedReadRWLock read_lock{rw_lock, ProfileEvents::DictCacheLockReadNs};
                     block = stream->read();
                     if (!block)
                         break;
                 }
 
+                ProfilingScopedWriteRWLock write_lock{rw_lock, ProfileEvents::DictCacheLockWriteNs};
                 const auto * id_column = typeid_cast<const ColumnUInt64 *>(block.safeGetByPosition(0).column.get());
                 if (!id_column)
                     throw Exception{name + ": id column has type different from UInt64.", ErrorCodes::TYPE_MISMATCH};
@@ -941,8 +942,12 @@ void CacheDictionary::update(BunchUpdateUnit & bunch_update_unit) const
                 }
             }
 
-            stream->readSuffix();
+            {
+                ProfilingScopedReadRWLock read_lock{rw_lock, ProfileEvents::DictCacheLockReadNs};
+                stream->readSuffix();
+            }
 
+            ProfilingScopedWriteRWLock write_lock{rw_lock, ProfileEvents::DictCacheLockWriteNs};
             error_count = 0;
             last_exception = std::exception_ptr{};
             backoff_end_time = std::chrono::system_clock::time_point{};
@@ -951,6 +956,8 @@ void CacheDictionary::update(BunchUpdateUnit & bunch_update_unit) const
         }
         catch (...)
         {
+
+            ProfilingScopedWriteRWLock write_lock{rw_lock, ProfileEvents::DictCacheLockWriteNs};
             ++error_count;
             last_exception = std::current_exception();
             backoff_end_time = now + std::chrono::seconds(calculateDurationWithBackoff(rnd_engine, error_count));
@@ -960,6 +967,7 @@ void CacheDictionary::update(BunchUpdateUnit & bunch_update_unit) const
         }
     }
 
+    ProfilingScopedWriteRWLock write_lock{rw_lock, ProfileEvents::DictCacheLockWriteNs};
     size_t not_found_num = 0;
     size_t found_num = 0;
 
